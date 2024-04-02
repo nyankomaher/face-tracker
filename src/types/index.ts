@@ -13,12 +13,14 @@ export type Mask = {
   path: string;
   isStill: boolean;
   thumbnail?: string;
+  width: number;
 }
 
 export type Source = {
   id: number;
   path: string;
   frameRate: number;
+  scale: number;
 }
 
 export type Settings = {
@@ -32,6 +34,7 @@ export type Settings = {
   maskRatio: number;
   margin: number;
   minSize: number;
+  gpu: boolean;
   interpolation: string;
   interpolationForWidth: string;
 }

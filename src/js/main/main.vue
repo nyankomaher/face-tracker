@@ -17,7 +17,7 @@ const INTERPOLATION_METHODS = [
   {id: 'akima', name: '秋間補間'},
 ]
 
-const DEFAULT_SETTINGS: Settings = {preset: 1, venv: '', script: '', imgsz: 960, stride: 2, iou: 0.70, conf: 0.20, maskRatio: 0.80, margin: 0.20, minSize: 70, interpolation: 'akima', interpolationForWidth: 'polynomial:3'};
+const DEFAULT_SETTINGS: Settings = {preset: 1, venv: '', script: '', imgsz: 960, stride: 2, iou: 0.70, conf: 0.20, maskRatio: 1.00, margin: 6, minSize: 100, interpolation: 'akima', interpolationForWidth: 'polynomial:3', gpu: false};
 const DEFAULT_PRESET: Preset = {id: 1, name: 'デフォルト', updatable: false, settings: {...DEFAULT_SETTINGS}};
 
 const useSettings = () => {
@@ -139,7 +139,7 @@ const useProgress = () => {
 const {progress, progressEl, appendProgress, clearProgress} = useProgress();
 
 
-const mask = ref<Mask>({id: null, name: '', path: '', isStill: true});
+const mask = ref<Mask>({id: null, name: '', path: '', isStill: true, width: 0});
 
 const selectMaskItem = async () => {
   const selected = await evalTS("selectMaskImage");
@@ -193,7 +193,16 @@ const startTracking = async () => {
     await new Promise<void>((resolve, reject) => {
       const python = settings.value.venv || 'python';
       const script = settings.value.script || path.join(__dirname, 'bin', 'track.py');
-      const args = [script, '-o', output, '-s', source.path, '-r', source.frameRate, '-t', settings.value.stride, '-z', settings.value.imgsz, '-i', settings.value.iou, '-c', settings.value.conf, '-m', settings.value.maskRatio, '-e', settings.value.minSize, '-n', settings.value.interpolation, '-x', settings.value.margin, '-w', settings.value.interpolationForWidth, '--nosave'].map(o => String(o));
+      const args = [
+        script, '--output', output, '--source', source.path, '--rate', source.frameRate, '--stride', settings.value.stride, 
+        '--imgsz', settings.value.imgsz, '--nosave', '--iou', settings.value.iou, '--conf', settings.value.conf,
+        '--mask-ratio', settings.value.maskRatio, '--mask-size', mask.value.width, '--min-size', settings.value.minSize,
+        '--interpolation', settings.value.interpolation, '--margin', settings.value.margin,
+        '--interpolation-for-width', settings.value.interpolationForWidth, '--scale', source.scale,
+      ].map(o => String(o));
+      if (settings.value.gpu) {
+        args.push('-d', 'mps');
+      }
       appendProgress(`COMMAND: ${python} ${args.join(' ')}`);
       const t = child_process.spawn(python, args);
       trackingProcess = t;
@@ -363,7 +372,7 @@ const copyProgress = () => {
           <div class="app__tracking__setting -short">
             <dt class="app__tracking__setting__title">マスク時間拡張</dt>
             <dd class="app__tracking__setting__desc">
-              <input type="number" min="0" max="9" step="0.01" :disabled="tracking" v-model="settings.margin" />
+              <input type="number" min="0" max="99" step="1" :disabled="tracking" v-model="settings.margin" />
             </dd>
           </div>
           <div class="app__tracking__setting -short">
@@ -393,6 +402,12 @@ const copyProgress = () => {
                   :key="method.id"
                   :value="method.id">{{method.name}}</option>
               </select>
+            </dd>
+          </div>
+          <div class="app__tracking__setting -short">
+            <dt class="app__tracking__setting__title">GPU</dt>
+            <dd class="app__tracking__setting__desc">
+              <input type="checkbox" value="1" :disabled="tracking" v-model="settings.gpu" />
             </dd>
           </div>
           <div class="app__tracking__venv app__tracking__setting">

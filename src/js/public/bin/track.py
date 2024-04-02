@@ -1,8 +1,10 @@
 import os
+
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'  # torchがインポートされるより先に設定する必要がある
+
 import sys
 import json
 import re
-import torch
 import argparse
 import datetime
 import numpy as np
@@ -27,10 +29,13 @@ parser.add_argument('-p', '--project', default=default_project_with_date)
 parser.add_argument('-i', '--iou', type=float, default=0.7)
 parser.add_argument('-c', '--conf', type=float, default=0.2)
 parser.add_argument('-m', '--mask-ratio', type=float, default=1.0)
-parser.add_argument('-e', '--min-size', type=int)
-parser.add_argument('-x', '--margin', type=float, default=0)
+parser.add_argument('-a', '--mask-size', type=int, default=100)
+parser.add_argument('-e', '--min-size', type=int, default=50)
+parser.add_argument('-x', '--margin', type=int, default=6)
+parser.add_argument('-d', '--device', default='mps')
 parser.add_argument('-n', '--interpolation', default='spline:3')
 parser.add_argument('-w', '--interpolation-for-width', default='polynomial:3')
+parser.add_argument('--scale', type=float, default=1)
 
 args = parser.parse_args()
 output = args.output
@@ -43,11 +48,16 @@ project = args.project
 iou = args.iou
 conf = args.conf
 mask_ratio = args.mask_ratio
+mask_size = args.mask_size
 min_size = args.min_size
 margin = args.margin
+device = args.device
 interpolation = args.interpolation
 interpolation_for_width = args.interpolation_for_width
+scale = args.scale
 trackingRate = frameRate / stride # frame数を秒数に直すための係数
+stride_second = stride / frameRate # strideを秒数に直したもの
+margin_frame_count = int(margin / stride) # marginを解析フレーム数に直したもの
 model_path = os.path.join(os.path.dirname(__file__), 'yolov8n.pt')
 tracker = os.path.join(os.path.dirname(__file__), 'boatsort.yaml')
 is_still = source.lower().endswith(('.png', '.jpg', '.jpeg'))
@@ -56,13 +66,14 @@ FrameBox = namedtuple('FrameBox', ('frame', 'xywh', 'xyxyn'))
 Face = namedtuple('Face', ('id', 'start', 'end', 'x', 'y', 'w'))
 
 interpolation_name_pattern = re.compile(r'^(polynomial|spline|akima)(:(\d+))?$')
+mask_offset_ratio = 0.3
 
 # YOLOv8モデルをロードしてトラッキング
 model = YOLO(model_path)
 if is_still:
     results = model.predict(source=source, classes=0, conf=conf, iou=iou, vid_stride=stride, imgsz=imgsz, verbose=True, save=save, project=project)
 else:
-    results = model.track(source=source, classes=0, tracker=tracker, conf=conf, iou=iou, vid_stride=stride, imgsz=imgsz, persist=True, stream=True, verbose=True, save=save, project=project)
+    results = model.track(source=source, classes=0, tracker=tracker, conf=conf, iou=iou, vid_stride=stride, imgsz=imgsz, persist=True, stream=True, verbose=True, save=save, project=project, device=device)
 
 
 # トラッキング結果をtrack_idごとにまとめる
@@ -75,9 +86,11 @@ for index, result in enumerate(results):
         if box.id:
             track_id = int(box.id[0])
         else: #単発のやつはtrack_idが振られない
-            continue  # 単発のやつはほぼノイズなので除外する
-            # track_id = f"N{no_tracking_id}"
-            # no_tracking_id = no_tracking_id + 1
+            if is_still:
+                track_id = f"N{no_tracking_id}"
+                no_tracking_id = no_tracking_id + 1
+            else:
+                continue  # 単発のやつはほぼノイズなので除外する
         frameBoxes = trackFrameBoxes[track_id] if track_id in trackFrameBoxes else []
         frameBoxes.append(FrameBox(index, box.xywh, box.xyxyn))
         trackFrameBoxes[track_id] = frameBoxes
@@ -86,20 +99,43 @@ def make_formulas(track_id, frameBoxes):
     seconds = np.array([frame / trackingRate for frame, _, _ in frameBoxes])
     xyxyns = np.array([xyxyn[0] for _, _, xyxyn in frameBoxes])
     xs, ys, ws, hs =  np.array([xywh[0] for _, xywh, _ in frameBoxes]).T # xywhではxyはバウンディングボックスの中心点
-    ys = ys + ((ws - hs) / 2) # マスクがバウンディングボックスの上辺に接するよう調整
     xs, ys, ws = adjust_cut_off(xs, ys, ws, hs, xyxyns)
-    ws = (ws * mask_ratio).clip(min_size or 0, None)
+    ws = (ws * mask_ratio).clip(min_size, None)
+    ys = ys + ((ws - hs) / 2) - (ws * mask_offset_ratio)  # マスクがバウンディングボックスの上辺からちょっと出るように調整
+    wps = ws / mask_size * 100 # pxから%になおす
 
     x = make_formula(track_id, seconds, xs, interpolation, 'x')
-    y = make_formula(track_id, seconds, ys, interpolation, 'y', show_plot=False)
-    w = make_formula(track_id, seconds, ws, interpolation_for_width, 'w')
+    y = make_formula(track_id, seconds, ys, interpolation, 'y')
+    w = make_formula(track_id, seconds, wps, interpolation_for_width, 'w')
 
     return [x, y, w]
 
 def make_formula(track_id, seconds, values, intp, axis, show_plot=False):
+    values = values * scale
     match = interpolation_name_pattern.search(intp)
     if not match:
         raise Exception(f'サポートしていない補間方法（{intp}）です。')
+
+    if len(seconds) >= 2:
+        # マスク時間拡張(margin)の分ダミーデータを追加する
+        if axis == 'y' or axis == 'w':  # y位置と幅は変化させないほうが有利っぽい
+            values = np.array([
+                *np.full(margin_frame_count, values[0]),
+                *values,
+                *np.full(margin_frame_count, values[-1]),
+            ])
+        else:
+            values = np.array([
+                *reversed(values[0] + np.arange(1, margin_frame_count + 1) * (values[0] - values[1])),
+                *values,
+                *(values[-1] + np.arange(1, margin_frame_count + 1) * (values[-1] - values[-2]))
+            ])
+        seconds = np.array([
+            *reversed(seconds[0] + np.arange(1, margin_frame_count + 1) * stride_second * -1),
+            *seconds,
+            *(seconds[-1] + np.arange(1, margin_frame_count + 1) * stride_second)
+        ])
+
     interpolation_name = match.group(1)
     degree = int(match.group(3) or 0)
 
@@ -109,7 +145,7 @@ def make_formula(track_id, seconds, values, intp, axis, show_plot=False):
         formula = make_spline_formula(track_id, seconds, values, frameBoxes, interpolation_name, degree or 3, axis, show_plot=show_plot)
 
     if axis == 'w':
-        formula = f'const w={formula};[w,w]'
+        formula = f'const w=Math.max({formula},{min_size/mask_size*100});[w,w]'
 
     if interpolation_name in ['spline', 'akima']:
         formula = prepend_import(formula)
@@ -118,10 +154,6 @@ def make_formula(track_id, seconds, values, intp, axis, show_plot=False):
 
 # パラメータのExpressionを作成
 def make_polynomial_fomula(track_id, seconds, values, degree, axis, show_plot=False):
-    if len(seconds) >= 2:
-        # 頭とおしりで数値の変化がバタつくので、ダミーデータを加えてなめらかにする
-        values = np.array([values[0], *values, values[-1]])
-        seconds = np.array([seconds[0] - margin, *seconds, seconds[-1] + margin])
     seconds =seconds[:, np.newaxis]
     values = values[:, np.newaxis]
     polynominal_features = PolynomialFeatures(degree=degree)
@@ -162,7 +194,7 @@ def make_spline_formula(track_id, seconds, values, frameBoxes, interpolation_nam
         raise Exception(f'サポートしていない補間方法（{interpolation_name}:{degree}）です。')
 
     if show_plot:
-        test_times = np.arange(start, end, 0.1)
+        test_times = np.arange(seconds[0], seconds[-1], 0.1)
         predicts = []
         for time in test_times:
             for i, x0 in reversed(list(enumerate(seconds[:-1]))): # akima/splineでは最後の1個はパラメータを作らないため[:-1]
@@ -179,17 +211,22 @@ def make_spline_formula(track_id, seconds, values, frameBoxes, interpolation_nam
         plot.show()
 
     # 係数をフレームごとに分ける
-    start_frame = frameBoxes[0].frame
-    end_frame = frameBoxes[-1].frame
+    start_frame = frameBoxes[0].frame - margin_frame_count
+    end_frame = frameBoxes[-1].frame + margin_frame_count
+    available_frames = [
+        *np.arange(margin_frame_count) + start_frame,
+        *[frameBox.frame for frameBox in frameBoxes],
+        *np.arange(margin_frame_count) + frameBoxes[-1].frame,
+    ]
     coefficients = np.full(end_frame - start_frame, None)
-    for i, frameBox in enumerate(frameBoxes[:-1]):
+    for i, available_frame in enumerate(available_frames[:-1]):  # 点と点の間に関して補完をするので、最後の1個に対するcoefficientはない。そのため-1
         coefficient = c[:, i].round().astype(np.int32).tolist()
-        coefficients[frameBox.frame - start_frame] = coefficient
+        coefficients[available_frame - start_frame] = coefficient
 
     params = {}
     params['axis'] = axis
-    params['start'] = frameBoxes[0].frame
-    params['end'] = frameBoxes[-1].frame
+    params['start'] = start_frame
+    params['end'] = end_frame
     params['frameRate'] = frameRate
     params['stride'] = stride
     params['coefficients'] = coefficients.tolist()
@@ -199,6 +236,9 @@ def make_spline_formula(track_id, seconds, values, frameBoxes, interpolation_nam
 # 人物が画面端（X軸方向）にいる場合見切れるため、認識した人物の幅が実際よりも小さくなってしまう。
 # このため、人物が画面端で見切れていないときの縦横幅を基準とし、
 # 人物が画面端にいるときの位置、幅を、そのときの高さから計算し直す。
+# また、人物が見切れていくときに高さの基準が頭から肩に移行するが、
+# その際に急激にY位置が変化しマスクが外れることがある。
+# Y位置の調整で対応したいが、良い方法が思い浮かばないので見切れ中はマスクサイズを大きくして対応する。
 def adjust_cut_off(xs, ys, ws, hs, xyxyns):
     # 人物がX軸方向に見切れていないときのx/y比の平均と、最大幅を求める
     aspects = []
@@ -210,21 +250,13 @@ def adjust_cut_off(xs, ys, ws, hs, xyxyns):
     
     # 見切れていないタイミングがない場合はそのまま
     if len(aspects) == 0:
-        return [xs, ws]
+        return [xs, ys, ws]
     
     aspect = np.mean(aspects)
     for i, xyxyn in enumerate(xyxyns):
         if xyxyn[0] == 0 or xyxyn[2] == 1:
-            # 推定幅を求める。最大幅より小さくはならない。
-            w = max(hs[i] * aspect, maxw)
-            # 左上の座標を求める（xsは中心座標のため） & 推定幅を反映した中心座標を求める
-            # y = ys[i] + ((w - ws[i]) / 2)
-            # if xyxyn[0] == 0: #左側
-            #     x = xs[i] + ((ws[i] - w) / 2)
-            # else: #右側
-            #     x = xs[i] + ((w - ws[i]) / 2)
-            # xs[i] = x
-            # ys[i] = y
+            # 推定幅を求める。最大幅より小さくはならない。また、見切れ中はマスクサイズを大きくする。
+            w = max(hs[i] * aspect, maxw) * 1.2
             ws[i] = w
             
     return [xs, ys, ws]
@@ -240,14 +272,15 @@ for [track_id, frameBoxes] in trackFrameBoxes.items():
         start = 0
         end = None
         xywh = frameBoxes[0].xywh # xywhではxyはバウンディングボックスの中心点
-        w = xywh[0, 2].item()
-        h = xywh[0, 3].item()
-        x = xywh[0, 0].item()
-        y = xywh[0, 1].item() + ((w - h) / 2) # マスクがバウンディングボックスの上辺に接するよう調整
+        w = xywh[0, 2].item() * scale
+        h = xywh[0, 3].item() * scale
+        x = xywh[0, 0].item() * scale
+        y = xywh[0, 1].item() * scale + ((w - h) / 2) - (w * mask_offset_ratio) # マスクがバウンディングボックスの上辺からちょっと出るように調整
+        w = max(w, min_size) / mask_size * 100  # pxから%に変換
 
     else:
-        start = frameBoxes[0].frame / trackingRate
-        end = frameBoxes[-1].frame / trackingRate
+        start = (frameBoxes[0].frame - margin_frame_count) / trackingRate
+        end = (frameBoxes[-1].frame + margin_frame_count) / trackingRate
         x, y, w = make_formulas(track_id, frameBoxes)
             
     face = Face(track_id, start, end, x, y, w)

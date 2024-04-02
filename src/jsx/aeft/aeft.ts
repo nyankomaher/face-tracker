@@ -12,19 +12,20 @@ export const selectMaskImage = (): Mask | void => {
     return;
   }
 
-  const mask = selection[0];
-  if (!isImage(mask)) {
+  const rawMask = selection[0];
+  if (!isImage(rawMask)) {
     alert('画像ではないアイテムが選択されています。画像を選択してください。');
     return;
   }
-
-  const mainSource = (mask as FootageItem).mainSource;
+  const mask = rawMask as FootageItem;
+  const mainSource = mask.mainSource;
 
   return {
     id: mask.id,
     name: mask.name,
     path: File(mainSource.file!.absoluteURI).fsName, // ~をルートからのパスに変える
     isStill: mainSource.isStill,
+    width: mask.width,
   };
 }
 
@@ -55,16 +56,19 @@ export const getSource = (): Source | void => {
 
   const source = (selected as AVLayer).source as FootageItem;
 
+  const scale = selected.transform.scale.value;
   return {
     id: source.id,
     path: File(source.file!.absoluteURI).fsName, // ~をルートからのパスに変える
     frameRate: source.frameRate,
+    scale: scale[0] / 100,
   };
 }
 
 export const addFaceMasks = (faces: Face[], maskId: number | null, settings: Settings) => {
   try {
-    importExpression();
+    const comp = getActiveComposition();
+    importExpression(comp);
 
     if (maskId === null) {
       alert('マスクに使用する画像が選択されていません。');
@@ -84,7 +88,6 @@ export const addFaceMasks = (faces: Face[], maskId: number | null, settings: Set
       return;
     }
 
-    const comp = getActiveComposition();
     for (let face of faces) {
       addFaceMask(face, mask, comp, settings);
     }
@@ -102,9 +105,9 @@ const addFaceMask = (face: Face, mask: FootageItem, comp: CompItem, settings: Se
   const anchor = transform.anchorPoint as TwoDProperty;
 
   layer.name = `TRACK_ID: ${face.id}`;
-  layer.startTime = Math.max(face.start - settings.margin, 0);
+  layer.startTime = face.start;
   if (!isStill) {
-    layer.outPoint = Math.min(face.end + settings.margin, comp.duration);
+    layer.outPoint = face.end;
   }
   anchor.setValue([mask.width / 2, mask.height / 2]);
   transform.position.dimensionsSeparated = true;
@@ -131,7 +134,7 @@ const getItem = <T>(name: string, folder: FolderItem): T => {
 
 const NYANKOMAHER_FOLDER = 'nyankomaher-face-tracker';
 const NYANKOMAHER_JSX = 'nyankomaher-face-tracker-functions.jsx';
-const importExpression = () => {
+const importExpression = (comp: CompItem) => {
   let folder: FolderItem | null = getItem(NYANKOMAHER_FOLDER, app.project.rootFolder)
   if (!folder) {
     folder = app.project.items.addFolder(NYANKOMAHER_FOLDER);
@@ -143,6 +146,20 @@ const importExpression = () => {
     const path = x.parent.parent.fsName + `/expression/${NYANKOMAHER_JSX}`;
     functions = app.project.importFile(new ImportOptions(new File(path))) as FootageItem;
     functions.parentFolder = folder;
+  }
+
+  // jsxをコンポジションに入れておかないとMediaEncoderでスクリプトが動かなくなる
+  let hasScript = false;
+  for (let i = 1; i <= comp.layers.length; i++) {
+    const layer = comp.layers[i];
+    if (layer.name === NYANKOMAHER_JSX) {
+      hasScript = true;
+      break;
+    }
+  }
+  if (!hasScript && functions) {
+    comp.layers.add(functions);
+    functions.selected = false;  // コンポジションに追加するとプロジェクトパネルで選択状態になるので、選択解除する
   }
 }
 

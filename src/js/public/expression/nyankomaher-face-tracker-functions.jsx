@@ -9,25 +9,17 @@
     },
 
     spline: (time, params) => {
-      // このframeはYOLOv8の解析間隔で分割されたフレームのことで、動画のフレームレートのことではない
-      let frame = Math.floor(time * params.frameRate / params.stride) - params.start;
-      if (frame < 0) {
-        frame = 0;
-        // y軸は上下動するため（だと思う）startとendの範囲外ではけっこうな勢いで上か下にすっとぶことがある問題の対策
-        if (params.axis == 'y') {
-          time = params.start / (params.frameRate / params.stride);
-        }
-      } else if (frame > params.coefficients.length - 1) {
-        frame = params.coefficients.length - 1;
-        if (params.axis == 'y') {
-          time = params.end / (params.frameRate / params.stride);
-        }
+      let rawIndex = Math.floor(time * params.frameRate / params.stride) - params.start;
+      if (rawIndex < 0) {
+        rawIndex = 0;
+      } else if (rawIndex > params.coefficients.length - 1) {
+        rawIndex = params.coefficients.length - 1;
       }
 
-      // coefficientsはnullのことがあるので、nullでないframeまで遡る
+      // coefficientsはnullのことがあるので、nullでないindexまで遡る
       let c = null;
       let index = null;
-      for (let i = frame; i >= 0; i--) {
+      for (let i = rawIndex; i >= 0; i--) {
         c = params.coefficients[i];
         if (c) {
           index = i;

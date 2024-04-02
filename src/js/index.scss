@@ -39,8 +39,6 @@ img {
 
 input,
 select {
-  width: 100%;
-
   &:not([readonly]) {
     padding: 2px 5px;
     border: 1px solid #AAA;
@@ -51,9 +49,34 @@ select {
   }
 }
 
+input:not([type="checkbox"]),
+select {
+  width: 100%;
+}
+
+input[type="checkbox"] {
+  position: relative;
+  width: 12px;
+  aspect-ratio: 1/1;
+
+  &:checked {
+    &:after {
+      margin: auto;
+      content: '';
+      display: block;
+      position: absolute;
+      inset: 0;
+      width: 6px;
+      aspect-ratio: 1/1;
+      background-color: #FFF;
+    }
+  }
+}
+
 input[type="search"] {
   appearance: searchfield;
 }
+
 input[type="search"]::-webkit-search-cancel-button {
   appearance: searchfield-cancel-button;
   cursor: pointer;
